@@ -367,6 +367,8 @@ let cart             = [];
 let PRODS            = [];      // Se carga desde Odoo o desde DEMO_PRODS
 let _clientTimer     = null;
 let _productTimer    = null;
+let PRICELIST_USD_ID  = null;   // ID de la lista "USD" con quiebres por cantidad (detectado en runtime)
+let _pricelistUsdTried = false;
 
 /* ═══════════════════════════════════════════════════════════════
    CATÁLOGO DEMO — Fallback si Odoo no está disponible
@@ -604,6 +606,73 @@ function selectPartner(id, name, vat) {
 }
 
 /* ═══════════════════════════════════════════════════════════════
+   REGLA 5B · LISTA DE PRECIOS "USD" CON QUIEBRE POR CANTIDAD
+   (ej. Rollo 100mt a $1.50/u en vez del precio base $1.80/u)
+   ═══════════════════════════════════════════════════════════════ */
+async function resolvePricelistUsdId() {
+  if (_pricelistUsdTried) return PRICELIST_USD_ID;
+  _pricelistUsdTried = true;
+  try {
+    const lists = await odooRPC('product.pricelist', 'search_read',
+      [[['id', '!=', CONFIG.PRICELIST_BCV]]],
+      { fields: ['id', 'name'], limit: 10 }
+    );
+    const usd = lists.find(l => /usd/i.test(l.name) && !/bcv/i.test(l.name)) || lists[0];
+    if (usd) PRICELIST_USD_ID = usd.id;
+  } catch (_e) { console.warn('[PricelistUSD]', _e.message); }
+  return PRICELIST_USD_ID;
+}
+
+/* Trae las reglas con "Cantidad mínima" > 0 de la lista USD para un producto
+   (a nivel de producto o de su categoría). Se ordenan de mayor a menor
+   min_quantity para poder elegir la más específica que aplique. */
+async function fetchQtyBreakRules(prodTmplId, categId) {
+  const usdListId = await resolvePricelistUsdId();
+  if (!usdListId) return [];
+  try {
+    const domain = [['pricelist_id', '=', usdListId]];
+    if (categId) domain.push('|', ['product_tmpl_id', '=', prodTmplId], ['categ_id', '=', categId]);
+    else domain.push(['product_tmpl_id', '=', prodTmplId]);
+
+    const items = await odooRPC('product.pricelist.item', 'search_read',
+      [domain],
+      { fields: ['min_quantity', 'compute_price', 'fixed_price', 'percent_price'], limit: 50 }
+    );
+    return items
+      .filter(i => (parseFloat(i.min_quantity) || 0) > 0)
+      .sort((a, b) => (parseFloat(b.min_quantity) || 0) - (parseFloat(a.min_quantity) || 0));
+  } catch (_e) { console.warn('[QtyBreakUSD]', _e.message); return []; }
+}
+
+/* Elige la regla de mayor min_quantity que la cantidad del embalaje cumpla */
+function pickUsdRule(rules, qty) {
+  for (const r of (rules || [])) {
+    if (qty >= (parseFloat(r.min_quantity) || 0)) return r;
+  }
+  return null;
+}
+
+/* Convierte una regla de lista en precio unitario USD.
+   Fallback: el precio base normal (p.pe) si no hay regla aplicable. */
+function ruleToUnitPrice(rule, basePrice) {
+  if (!rule) return basePrice;
+  if (rule.compute_price === 'fixed')
+    return parseFloat(rule.fixed_price) || basePrice;
+  if (rule.compute_price === 'percentage')
+    return basePrice * (1 - (parseFloat(rule.percent_price) || 0) / 100);
+  return basePrice;
+}
+
+/* Precio unitario BCV para un embalaje: no existe (por ahora) una lista BCV
+   con su propio quiebre por cantidad, así que se mantiene la misma
+   proporción BCV/USD ya calculada para el producto (p.pb / p.pe) y se
+   aplica sobre el precio unitario correcto (el de la lista, si aplica). */
+function bcvUnitFor(p, unitUsd) {
+  const ratio = p.pe > 0 ? (p.pb / p.pe) : 1;
+  return unitUsd * ratio;
+}
+
+/* ═══════════════════════════════════════════════════════════════
    REGLA 4 · BÚSQUEDA DE PRODUCTOS DESDE ODOO
    ═══════════════════════════════════════════════════════════════ */
 async function loadOdooProducts(q) {
@@ -715,6 +784,7 @@ async function loadOdooProducts(q) {
       imgSrc:    p.image_128 ? 'data:image/png;base64,' + p.image_128 : null,
       variantId: Array.isArray(p.product_variant_ids) && p.product_variant_ids[0] ? p.product_variant_ids[0] : p.id,
       categ:  Array.isArray(p.categ_id) ? p.categ_id[1] : '',
+      categId: Array.isArray(p.categ_id) ? p.categ_id[0] : null,
     };
   });
 }
@@ -796,8 +866,14 @@ function addItem(id, qty) {
 function addPkg(id, factor, pkgName, uomId) {
   const p = getProds().find(x => x.id === id);
   if (!p) return;
-  const boxPb = Math.round(p.pb * factor * 100) / 100;
-  const boxPe = Math.round(p.pe * factor * 100) / 100;
+  /* REGLA 5B: mismo cálculo que en la ficha — si hay una regla de la lista
+     "USD" con cantidad mínima aplicable a este embalaje, se usa ese precio
+     unitario en vez de multiplicar el precio base por la cantidad. */
+  const rule    = pickUsdRule(p._usdRules, factor);
+  const unitUsd = ruleToUnitPrice(rule, p.pe);
+  const unitBcv = bcvUnitFor(p, unitUsd);
+  const boxPb = Math.round(unitBcv * factor * 100) / 100;
+  const boxPe = Math.round(unitUsd * factor * 100) / 100;
   const idx = cart.findIndex(x => x.id === id && x._uomId === uomId);
   if (idx > -1) {
     cart[idx].qty = clamp(cart[idx].qty + 1);
@@ -965,19 +1041,32 @@ function buildFichaHTML(p, pkgs) {
   const bloques = (pkgs || []).map(pkg => {
     const qty = parseFloat(pkg.qty) || 1;
     const nombre = pkg.name || 'Caja';
+    /* REGLA 5B: si la lista de precios "USD" trae una regla de cantidad
+       mínima que aplica a esta cantidad de embalaje, se usa ESE precio
+       unitario en vez de multiplicar el precio base por la cantidad. */
+    const rule    = pickUsdRule(p._usdRules, qty);
+    const unitUsd = ruleToUnitPrice(rule, p.pe);
+    const unitBcv = bcvUnitFor(p, unitUsd);
+    const totalUsd = unitUsd * qty;
+    const totalBcv = unitBcv * qty;
+    const filaLista = rule ? `<div class="precio-row">
+        <span class="precio-lbl"><span class="badge-e">LISTA</span> Precio unitario (desde ${rule.min_quantity} ${p.uom})</span>
+        <span class="precio-val-e">${fUSD(unitUsd)}</span>
+      </div>` : '';
     return `<div class="precio-bloque">
       <div class="precio-bloque-title">🗃️ ${nombre} · <span class="emb-badge">x${qty} ${p.uom}</span></div>
+      ${filaLista}
       <div class="precio-row">
         <span class="precio-lbl"><span class="badge-e">USD</span> Precio ${nombre}</span>
-        <span class="precio-val-e">${fUSD(p.pe * qty)}</span>
+        <span class="precio-val-e">${fUSD(totalUsd)}</span>
       </div>
       <div class="precio-row">
         <span class="precio-lbl"><span class="badge-b">BCV</span> ${nombre} BCV</span>
-        <span class="precio-val-b">${fUSD(p.pb * qty)}</span>
+        <span class="precio-val-b">${fUSD(totalBcv)}</span>
       </div>
       <div class="precio-row">
         <span class="precio-lbl"><span class="badge-b">BCV</span> ${nombre} en Bs.</span>
-        <span class="precio-val-bs">${fBs(p.pb * qty * TASA)}</span>
+        <span class="precio-val-bs">${fBs(totalBcv * TASA)}</span>
       </div>
     </div>`;
   }).join('');
@@ -1090,11 +1179,14 @@ async function verFicha(id) {
   document.getElementById('ficha-body').innerHTML = buildFichaHTML(p, null);
   goTo('scr-ficha');
 
-  /* Cargar embalajes desde Odoo via uom_ids (uom.uom) */
+  /* Cargar embalajes desde Odoo via uom_ids (uom.uom), y en paralelo las
+     reglas de la lista "USD" con quiebre por cantidad (REGLA 5B) */
   try {
     await odooAuthenticate();
-    const varDat = await odooRPC('product.product', 'read',
-      [[p.variantId]], { fields: ['uom_ids'] });
+    const [varDat, usdRules] = await Promise.all([
+      odooRPC('product.product', 'read', [[p.variantId]], { fields: ['uom_ids'] }),
+      fetchQtyBreakRules(p.id, p.categId),
+    ]);
     const uomIds = (varDat[0] && varDat[0].uom_ids) || [];
     let pkgs = [];
     if (uomIds.length) {
@@ -1102,6 +1194,7 @@ async function verFicha(id) {
         [uomIds], { fields: ['id', 'name', 'factor'] });
       pkgs = uoms.map(u => ({ id: u.id, name: u.name, qty: u.factor }));
     }
+    p._usdRules = usdRules; // se reutiliza en addPkg al agregar al carrito
     document.getElementById('ficha-body').innerHTML = buildFichaHTML(p, pkgs);
   } catch(_e) { console.warn('[PkgERR]', _e.message); }
 }
