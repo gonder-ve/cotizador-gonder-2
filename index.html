@@ -355,6 +355,14 @@ const CONFIG = {
 
   /* — Modo demo: usa productos locales si Odoo no está disponible — */
   DEMO_FALLBACK: true,
+
+  /* — Stock "Porcelanatos OV" (Google Sheet compartido por grupogonder@gmail.com) —
+     Columnas esperadas: Codigo, Descripcion, Precio, S. Mcbo, S.Valencia.
+     Si el sheet tiene más de una pestaña y los datos no están en la primera,
+     ajustar STOCK_SHEET_GID al gid correcto (visible en la URL tras #gid=). */
+  STOCK_SHEET_ID:  '1YwAH6vRrUXFwgI-7D9yJArMlG63wwZsc5arG6zCIpnw',
+  STOCK_SHEET_GID: '0',
+  STOCK_CACHE_MS:  120000,          // Re-usa el CSV descargado hasta por 2 min entre fichas
 };
 
 /* ═══════════════════════════════════════════════════════════════
@@ -367,8 +375,9 @@ let cart             = [];
 let PRODS            = [];      // Se carga desde Odoo o desde DEMO_PRODS
 let _clientTimer     = null;
 let _productTimer    = null;
-let PRICELIST_USD_ID  = null;   // ID de la lista "USD" con quiebres por cantidad (detectado en runtime)
-let _pricelistUsdTried = false;
+let _stockMap         = null;   // Cache en memoria: { CODIGO: {mcbo, valencia} }
+let _stockFetchedAt    = 0;
+let _stockFetchPromise = null;  // Evita descargas duplicadas si dos fichas se abren rápido
 
 /* ═══════════════════════════════════════════════════════════════
    CATÁLOGO DEMO — Fallback si Odoo no está disponible
@@ -479,6 +488,112 @@ function applyTasa(rate, isCache = false) {
   document.getElementById('tasa-val').textContent = rate.toFixed(2);
   if (!isCache) toast('💱 Tasa BCV actualizada: Bs. ' + rate.toFixed(2), 'info');
   if (cart.length) updateTotals();
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   STOCK "PORCELANATOS OV" — Google Sheet "OVERLAND STOCK"
+   Columnas: Codigo, Descripcion, Precio, S. Mcbo, S.Valencia.
+   Se lee el CSV publicado del sheet (mismo patrón de proxies CORS que
+   la tasa BCV) y se cachea unos minutos para no re-descargar en cada
+   ficha si el vendedor navega varios productos seguidos.
+   ═══════════════════════════════════════════════════════════════ */
+
+/** Parser de una línea CSV con soporte de campos entre comillas (para
+ *  valores con comas de miles, ej. "1,332.72"). */
+function parseCsvLine(line) {
+  const out = [];
+  let cur = '', inQuotes = false;
+  for (let i = 0; i < line.length; i++) {
+    const ch = line[i];
+    if (inQuotes) {
+      if (ch === '"') {
+        if (line[i + 1] === '"') { cur += '"'; i++; }
+        else inQuotes = false;
+      } else cur += ch;
+    } else {
+      if (ch === '"') inQuotes = true;
+      else if (ch === ',') { out.push(cur); cur = ''; }
+      else cur += ch;
+    }
+  }
+  out.push(cur);
+  return out;
+}
+
+/** Convierte "$40.41", "1,332.72", "115.20" (e incluso el caso ocasional
+ *  "250,56" mal tipeado con coma decimal en vez de punto) en número. */
+function parseStockNum(raw) {
+  if (raw === undefined || raw === null) return null;
+  let s = String(raw).trim().replace(/[^0-9.,\-]/g, '');
+  if (!s) return null;
+  if (s.includes(',') && s.includes('.')) {
+    s = s.replace(/,/g, '');            // "1,332.72" → coma = separador de miles
+  } else if (s.includes(',') && !s.includes('.')) {
+    s = s.replace(',', '.');            // "250,56" → coma usada como decimal
+  }
+  const n = parseFloat(s);
+  return isNaN(n) ? null : n;
+}
+
+/** Descarga y parsea el CSV del sheet de stock. Filas de título de
+ *  sección (ej. "BERI STONE") y encabezados repetidos se descartan
+ *  automáticamente por no traer 5 columnas o por Codigo no numérico/vacío. */
+async function fetchStockCsvRaw() {
+  const sheetUrl = `https://docs.google.com/spreadsheets/d/${CONFIG.STOCK_SHEET_ID}/gviz/tq?tqx=out:csv&gid=${CONFIG.STOCK_SHEET_GID}`;
+  const attempts = [
+    () => fetch('https://api.allorigins.win/raw?url=' + encodeURIComponent(sheetUrl), { signal: makeSignal(10000) }),
+    () => fetch('https://corsproxy.io/?' + encodeURIComponent(sheetUrl), { signal: makeSignal(10000) }),
+  ];
+  for (const attempt of attempts) {
+    try {
+      const r = await attempt();
+      if (r.ok) {
+        const text = await r.text();
+        if (text && text.length > 20) return text;
+      }
+    } catch (_) { /* próximo intento */ }
+  }
+  return null;
+}
+
+function parseStockCsv(csvText) {
+  const map = {};
+  const lines = csvText.split(/\r?\n/);
+  for (const line of lines) {
+    if (!line || !line.trim()) continue;
+    const cols = parseCsvLine(line);
+    if (cols.length < 5) continue;                  // fila incompleta
+    const cod  = (cols[0] || '').trim();
+    const desc = (cols[1] || '').trim();
+    if (!cod || !desc) continue;                     // título de sección (ej. "BERI STONE") o fila vacía
+    if (/^codigo$/i.test(cod)) continue;              // header repetido dentro del sheet
+    const mcbo     = parseStockNum(cols[3]);
+    const valencia = parseStockNum(cols[4]);
+    if (mcbo === null && valencia === null) continue;
+    map[cod.toUpperCase()] = { mcbo: mcbo || 0, valencia: valencia || 0 };
+  }
+  return map;
+}
+
+/** Devuelve el mapa { CODIGO: {mcbo, valencia} }, usando cache de
+ *  CONFIG.STOCK_CACHE_MS. No lanza excepciones: si falla, retorna null
+ *  y quien llama debe mostrar un estado amigable, nunca colgar la ficha. */
+async function getStockMap() {
+  const now = Date.now();
+  if (_stockMap && (now - _stockFetchedAt) < CONFIG.STOCK_CACHE_MS) return _stockMap;
+  if (_stockFetchPromise) return _stockFetchPromise;   // ya hay una descarga en curso
+  _stockFetchPromise = (async () => {
+    try {
+      const csv = await fetchStockCsvRaw();
+      if (!csv) return _stockMap; // conserva cache anterior si existía
+      const map = parseStockCsv(csv);
+      if (Object.keys(map).length) { _stockMap = map; _stockFetchedAt = Date.now(); }
+      return _stockMap;
+    } finally {
+      _stockFetchPromise = null;
+    }
+  })();
+  return _stockFetchPromise;
 }
 
 /* ═══════════════════════════════════════════════════════════════
@@ -606,73 +721,6 @@ function selectPartner(id, name, vat) {
 }
 
 /* ═══════════════════════════════════════════════════════════════
-   REGLA 5B · LISTA DE PRECIOS "USD" CON QUIEBRE POR CANTIDAD
-   (ej. Rollo 100mt a $1.50/u en vez del precio base $1.80/u)
-   ═══════════════════════════════════════════════════════════════ */
-async function resolvePricelistUsdId() {
-  if (_pricelistUsdTried) return PRICELIST_USD_ID;
-  _pricelistUsdTried = true;
-  try {
-    const lists = await odooRPC('product.pricelist', 'search_read',
-      [[['id', '!=', CONFIG.PRICELIST_BCV]]],
-      { fields: ['id', 'name'], limit: 10 }
-    );
-    const usd = lists.find(l => /usd/i.test(l.name) && !/bcv/i.test(l.name)) || lists[0];
-    if (usd) PRICELIST_USD_ID = usd.id;
-  } catch (_e) { console.warn('[PricelistUSD]', _e.message); }
-  return PRICELIST_USD_ID;
-}
-
-/* Trae las reglas con "Cantidad mínima" > 0 de la lista USD para un producto
-   (a nivel de producto o de su categoría). Se ordenan de mayor a menor
-   min_quantity para poder elegir la más específica que aplique. */
-async function fetchQtyBreakRules(prodTmplId, categId) {
-  const usdListId = await resolvePricelistUsdId();
-  if (!usdListId) return [];
-  try {
-    const domain = [['pricelist_id', '=', usdListId]];
-    if (categId) domain.push('|', ['product_tmpl_id', '=', prodTmplId], ['categ_id', '=', categId]);
-    else domain.push(['product_tmpl_id', '=', prodTmplId]);
-
-    const items = await odooRPC('product.pricelist.item', 'search_read',
-      [domain],
-      { fields: ['min_quantity', 'compute_price', 'fixed_price', 'percent_price'], limit: 50 }
-    );
-    return items
-      .filter(i => (parseFloat(i.min_quantity) || 0) > 0)
-      .sort((a, b) => (parseFloat(b.min_quantity) || 0) - (parseFloat(a.min_quantity) || 0));
-  } catch (_e) { console.warn('[QtyBreakUSD]', _e.message); return []; }
-}
-
-/* Elige la regla de mayor min_quantity que la cantidad del embalaje cumpla */
-function pickUsdRule(rules, qty) {
-  for (const r of (rules || [])) {
-    if (qty >= (parseFloat(r.min_quantity) || 0)) return r;
-  }
-  return null;
-}
-
-/* Convierte una regla de lista en precio unitario USD.
-   Fallback: el precio base normal (p.pe) si no hay regla aplicable. */
-function ruleToUnitPrice(rule, basePrice) {
-  if (!rule) return basePrice;
-  if (rule.compute_price === 'fixed')
-    return parseFloat(rule.fixed_price) || basePrice;
-  if (rule.compute_price === 'percentage')
-    return basePrice * (1 - (parseFloat(rule.percent_price) || 0) / 100);
-  return basePrice;
-}
-
-/* Precio unitario BCV para un embalaje: no existe (por ahora) una lista BCV
-   con su propio quiebre por cantidad, así que se mantiene la misma
-   proporción BCV/USD ya calculada para el producto (p.pb / p.pe) y se
-   aplica sobre el precio unitario correcto (el de la lista, si aplica). */
-function bcvUnitFor(p, unitUsd) {
-  const ratio = p.pe > 0 ? (p.pb / p.pe) : 1;
-  return unitUsd * ratio;
-}
-
-/* ═══════════════════════════════════════════════════════════════
    REGLA 4 · BÚSQUEDA DE PRODUCTOS DESDE ODOO
    ═══════════════════════════════════════════════════════════════ */
 async function loadOdooProducts(q) {
@@ -784,7 +832,6 @@ async function loadOdooProducts(q) {
       imgSrc:    p.image_128 ? 'data:image/png;base64,' + p.image_128 : null,
       variantId: Array.isArray(p.product_variant_ids) && p.product_variant_ids[0] ? p.product_variant_ids[0] : p.id,
       categ:  Array.isArray(p.categ_id) ? p.categ_id[1] : '',
-      categId: Array.isArray(p.categ_id) ? p.categ_id[0] : null,
     };
   });
 }
@@ -866,14 +913,8 @@ function addItem(id, qty) {
 function addPkg(id, factor, pkgName, uomId) {
   const p = getProds().find(x => x.id === id);
   if (!p) return;
-  /* REGLA 5B: mismo cálculo que en la ficha — si hay una regla de la lista
-     "USD" con cantidad mínima aplicable a este embalaje, se usa ese precio
-     unitario en vez de multiplicar el precio base por la cantidad. */
-  const rule    = pickUsdRule(p._usdRules, factor);
-  const unitUsd = ruleToUnitPrice(rule, p.pe);
-  const unitBcv = bcvUnitFor(p, unitUsd);
-  const boxPb = Math.round(unitBcv * factor * 100) / 100;
-  const boxPe = Math.round(unitUsd * factor * 100) / 100;
+  const boxPb = Math.round(p.pb * factor * 100) / 100;
+  const boxPe = Math.round(p.pe * factor * 100) / 100;
   const idx = cart.findIndex(x => x.id === id && x._uomId === uomId);
   if (idx > -1) {
     cart[idx].qty = clamp(cart[idx].qty + 1);
@@ -1041,32 +1082,19 @@ function buildFichaHTML(p, pkgs) {
   const bloques = (pkgs || []).map(pkg => {
     const qty = parseFloat(pkg.qty) || 1;
     const nombre = pkg.name || 'Caja';
-    /* REGLA 5B: si la lista de precios "USD" trae una regla de cantidad
-       mínima que aplica a esta cantidad de embalaje, se usa ESE precio
-       unitario en vez de multiplicar el precio base por la cantidad. */
-    const rule    = pickUsdRule(p._usdRules, qty);
-    const unitUsd = ruleToUnitPrice(rule, p.pe);
-    const unitBcv = bcvUnitFor(p, unitUsd);
-    const totalUsd = unitUsd * qty;
-    const totalBcv = unitBcv * qty;
-    const filaLista = rule ? `<div class="precio-row">
-        <span class="precio-lbl"><span class="badge-e">LISTA</span> Precio unitario (desde ${rule.min_quantity} ${p.uom})</span>
-        <span class="precio-val-e">${fUSD(unitUsd)}</span>
-      </div>` : '';
     return `<div class="precio-bloque">
       <div class="precio-bloque-title">🗃️ ${nombre} · <span class="emb-badge">x${qty} ${p.uom}</span></div>
-      ${filaLista}
       <div class="precio-row">
         <span class="precio-lbl"><span class="badge-e">USD</span> Precio ${nombre}</span>
-        <span class="precio-val-e">${fUSD(totalUsd)}</span>
+        <span class="precio-val-e">${fUSD(p.pe * qty)}</span>
       </div>
       <div class="precio-row">
         <span class="precio-lbl"><span class="badge-b">BCV</span> ${nombre} BCV</span>
-        <span class="precio-val-b">${fUSD(totalBcv)}</span>
+        <span class="precio-val-b">${fUSD(p.pb * qty)}</span>
       </div>
       <div class="precio-row">
         <span class="precio-lbl"><span class="badge-b">BCV</span> ${nombre} en Bs.</span>
-        <span class="precio-val-bs">${fBs(totalBcv * TASA)}</span>
+        <span class="precio-val-bs">${fBs(p.pb * qty * TASA)}</span>
       </div>
     </div>`;
   }).join('');
@@ -1132,6 +1160,24 @@ function buildFichaHTML(p, pkgs) {
     </div>`;
   }
 
+  /* Stock Disponible — solo para categoría "Porcelanatos OV" (Google Sheet
+     "OVERLAND STOCK"). Se pinta un placeholder de inmediato; renderStockBlock()
+     lo completa async sin bloquear el resto de la ficha. */
+  const esPorcelanatoOV = p.categ && p.categ.includes('Porcelanatos OV');
+  let stockHtml = '';
+  if (esPorcelanatoOV) {
+    stockHtml = `
+    <div style="background:#fff;border:2px solid #111;border-radius:16px;overflow:hidden;margin-top:12px">
+      <div style="background:#000;padding:10px 16px;display:flex;align-items:center;gap:8px">
+        <span style="font-size:16px">🏬</span>
+        <span style="color:#FFD600;font-size:14px;font-weight:700">Stock Disponible</span>
+      </div>
+      <div style="padding:12px 16px" id="stock-body-${p.id}">
+        <div style="color:#94a3b8;font-size:12px;text-align:center;padding:6px 0">Consultando stock…</div>
+      </div>
+    </div>`;
+  }
+
   return `
     <div class="ficha-img">${p.imgSrc ? `<img src="${p.imgSrc}" style="width:100%;height:140px;object-fit:contain;border-radius:12px">` : p.emoji}</div>
     <div class="ficha-nombre">${p.nombre}</div>
@@ -1157,7 +1203,41 @@ function buildFichaHTML(p, pkgs) {
       ${btnsPkgs}
     </div>
     ${calcHtml}
+    ${stockHtml}
   `;
+}
+
+/** Completa el bloque "Stock Disponible" de forma async. Si el bloque no
+ *  existe en el DOM (producto no es "Porcelanatos OV", o la ficha cambió
+ *  mientras cargaba), no hace nada — nunca lanza error visible al vendedor. */
+async function renderStockBlock(prodId, cod, uom) {
+  const body = document.getElementById('stock-body-' + prodId);
+  if (!body) return;
+  try {
+    const map = await getStockMap();
+    const bodyNow = document.getElementById('stock-body-' + prodId);
+    if (!bodyNow) return; // el vendedor ya navegó a otra ficha
+    const entry = map ? map[String(cod).trim().toUpperCase()] : null;
+    if (!entry) {
+      bodyNow.innerHTML = `<div style="color:#94a3b8;font-size:12px;text-align:center;padding:6px 0">Sin datos de stock para este código</div>`;
+      return;
+    }
+    const row = (label, val, isLast) => {
+      const has = val > 0;
+      const bg  = has ? '#EAF3DE' : '#FCEBEB';
+      const fg  = has ? '#27500A' : '#791F1F';
+      const txt = (Math.round(val * 100) / 100).toLocaleString('es-VE', { maximumFractionDigits: 2 });
+      return `<div style="display:flex;align-items:center;justify-content:space-between;padding:8px 0;${isLast ? '' : 'border-bottom:0.5px solid #eee'}">
+        <span style="color:#555;font-size:13px;font-weight:500">${label}</span>
+        <span style="background:${bg};color:${fg};font-size:13px;font-weight:800;padding:3px 10px;border-radius:8px">${txt} ${uom}</span>
+      </div>`;
+    };
+    bodyNow.innerHTML = row('Almacén Valencia', entry.valencia, false) + row('Almacén Maracaibo', entry.mcbo, true);
+  } catch (_e) {
+    const bodyErr = document.getElementById('stock-body-' + prodId);
+    if (bodyErr) bodyErr.innerHTML = `<div style="color:#94a3b8;font-size:12px;text-align:center;padding:6px 0">No se pudo consultar el stock</div>`;
+    console.warn('[Stock]', _e && _e.message);
+  }
 }
 
 function calcCajas(val, m2perCaja, prodId) {
@@ -1178,15 +1258,13 @@ async function verFicha(id) {
   /* Render inmediato sin embalaje */
   document.getElementById('ficha-body').innerHTML = buildFichaHTML(p, null);
   goTo('scr-ficha');
+  renderStockBlock(p.id, p.cod, p.uom); // async, no bloquea la ficha (Regla: cero caídas)
 
-  /* Cargar embalajes desde Odoo via uom_ids (uom.uom), y en paralelo las
-     reglas de la lista "USD" con quiebre por cantidad (REGLA 5B) */
+  /* Cargar embalajes desde Odoo via uom_ids (uom.uom) */
   try {
     await odooAuthenticate();
-    const [varDat, usdRules] = await Promise.all([
-      odooRPC('product.product', 'read', [[p.variantId]], { fields: ['uom_ids'] }),
-      fetchQtyBreakRules(p.id, p.categId),
-    ]);
+    const varDat = await odooRPC('product.product', 'read',
+      [[p.variantId]], { fields: ['uom_ids'] });
     const uomIds = (varDat[0] && varDat[0].uom_ids) || [];
     let pkgs = [];
     if (uomIds.length) {
@@ -1194,8 +1272,8 @@ async function verFicha(id) {
         [uomIds], { fields: ['id', 'name', 'factor'] });
       pkgs = uoms.map(u => ({ id: u.id, name: u.name, qty: u.factor }));
     }
-    p._usdRules = usdRules; // se reutiliza en addPkg al agregar al carrito
     document.getElementById('ficha-body').innerHTML = buildFichaHTML(p, pkgs);
+    renderStockBlock(p.id, p.cod, p.uom); // el bloque se recreó, hay que rellenarlo de nuevo
   } catch(_e) { console.warn('[PkgERR]', _e.message); }
 }
 
@@ -1246,10 +1324,10 @@ async function sendToOdoo() {
     const orderId = await odooRPC('sale.order', 'create',
       [{
         partner_id:        partnerId,
-        company_id:        4,                     // GONDER LISANDRO ALVARADO 2 (hija de GRUPO GONDER)
         state:             'draft',
         client_order_ref:  vendedor,
         pricelist_id:      CONFIG.PRICELIST_BCV,
+        company_id:        4,                     // GONDER LISANDRO ALVARADO 2 (hija de GRUPO GONDER)
         note:              `Cotización generada en piso de venta por ${vendedor} – Cotizador GONDER`,
       }],
       {}
@@ -1321,7 +1399,7 @@ function buildWAMsg() {
     `_Tasa BCV del día: Bs. ${TASA.toFixed(2)}_`,
     ``,
     `📲 *@Gonderve*`,
-    `📞 *WhatsApp: 0414-357700*`,
+    `📞 *WhatsApp: 0414-4015664*`,
   ].join('\n');
 }
 
