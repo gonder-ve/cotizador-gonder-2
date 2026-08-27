@@ -543,8 +543,8 @@ function parseStockNum(raw) {
 async function fetchStockCsvRaw() {
   const sheetUrl = `https://docs.google.com/spreadsheets/d/${CONFIG.STOCK_SHEET_ID}/gviz/tq?tqx=out:csv&gid=${CONFIG.STOCK_SHEET_GID}`;
   const attempts = [
+    () => fetch(sheetUrl, { signal: makeSignal(10000) }),
     () => fetch('https://api.allorigins.win/raw?url=' + encodeURIComponent(sheetUrl), { signal: makeSignal(10000) }),
-    () => fetch('https://corsproxy.io/?' + encodeURIComponent(sheetUrl), { signal: makeSignal(10000) }),
   ];
   for (const attempt of attempts) {
     try {
