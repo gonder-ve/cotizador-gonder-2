@@ -529,7 +529,7 @@ function parseStockNum(raw) {
   let s = String(raw).trim().replace(/[^0-9.,\-]/g, '');
   if (!s) return null;
   if (s.includes(',') && s.includes('.')) {
-    s = s.replace(/,/g, '');            // "1,332.72" → coma = separador de miles
+    if (s.lastIndexOf(',') > s.lastIndexOf('.')) { s = s.replace(/\./g, '').replace(',', '.'); } else { s = s.replace(/,/g, ''); }
   } else if (s.includes(',') && !s.includes('.')) {
     s = s.replace(',', '.');            // "250,56" → coma usada como decimal
   }
@@ -1306,7 +1306,7 @@ async function renderStockBlock(prodId, cod, uom) {
     const map = await getStockMap();
     const bodyNow = document.getElementById('stock-body-' + prodId);
     if (!bodyNow) return; // el vendedor ya navegó a otra ficha
-    const entry = map ? map[String(cod).trim().toUpperCase()] : null;
+    if (!map) { bodyNow.innerHTML = `<div style="color:#94a3b8;font-size:12px;text-align:center;padding:6px 0">No se pudo cargar el stock (sin conexión al sheet) — reintenta más tarde</div>`; return; } const entry = map[String(cod).trim().toUpperCase()];
     if (!entry) {
       bodyNow.innerHTML = `<div style="color:#94a3b8;font-size:12px;text-align:center;padding:6px 0">Sin datos de stock para este código</div>`;
       return;
