@@ -543,7 +543,7 @@ function parseStockNum(raw) {
 async function fetchStockCsvRaw() {
   const sheetUrl = `https://docs.google.com/spreadsheets/d/${CONFIG.STOCK_SHEET_ID}/gviz/tq?tqx=out:csv&gid=${CONFIG.STOCK_SHEET_GID}`;
   const attempts = [
-    () => fetch('https://api.codetabs.com/v1/proxy?quest=' + encodeURIComponent(sheetUrl), { signal: makeSignal(10000) }),
+    async () => { const r = await fetch('https://api.allorigins.win/get?url=' + encodeURIComponent(sheetUrl), { signal: makeSignal(15000) }); const j = await r.json(); return { ok: !!(j && j.contents), text: async () => j.contents }; },
     () => fetch('https://api.allorigins.win/raw?url=' + encodeURIComponent(sheetUrl), { signal: makeSignal(10000) }),
   ];
   for (const attempt of attempts) {
