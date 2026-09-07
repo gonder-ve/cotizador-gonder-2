@@ -451,7 +451,7 @@ async function fetchBCVRate() {
     const rate = parseFloat(m[1].replace(/\./g, '').replace(',', '.'));
     return (!isNaN(rate) && rate > 1) ? rate : null;
   }
-  /* allorigins devuelve JSON {contents:"html"} */
+  try { const rw = await fetch('https://gentle-wildflower-a72f.grupogonder-160.workers.dev/bcv-html', { headers: { 'X-Api-Key': 'vJvv2p2Uz-4PmixpU-s6zDJ3lRdLLzJwODFChwdCF-g' }, signal: makeSignal(15000) }); if (rw.ok) { const htmlw = await rw.text(); const ratew = parseBCVHtml(htmlw); if (ratew) { applyTasa(ratew); return; } } } catch (_) {} /* allorigins devuelve JSON {contents:"html"} */
   try {
     const r = await fetch('https://api.allorigins.win/get?url=' + encodeURIComponent('https://www.bcv.org.ve/'), { signal: makeSignal(10000) });
     if (r.ok) {
