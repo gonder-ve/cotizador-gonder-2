@@ -4,7 +4,7 @@
                Network-only para APIs externas (Odoo, BCV)
    ============================================================ */
 
-const CACHE = 'gonder-v1';
+const CACHE = 'gonder-v2';
 const ASSETS = [
   './index.html',
   './manifest.json',
